@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0">
+<title>堺市 やさい配送ひろば</title>
+
+<!--
+  ▼▼▼ ここから：Supabase（共有データベース・ログイン）の設定 ▼▼▼
+  Supabaseの無料プロジェクトにつなぐと、依頼をみんなで共有できます。未設定の間は「この端末だけ」の簡易モードで動きます。
+
+  1. https://supabase.com/ で無料プロジェクトを作成
+  2. 「SQL Editor」で次を実行（依頼を1件ずつ別の行に保存し、住所・連絡先・メッセージは当事者だけが読めるようにします）：
+
+      create table requests (
+        id text primary key,
+        requester_id uuid not null references auth.users(id) on delete cascade,
+        courier_id uuid references auth.users(id) on delete set null,
+        status text not null default 'open',
+        data jsonb not null,
+        deadline timestamptz,
+        created_at timestamptz not null default now()
+      );
+      create table request_private (
+        request_id text primary key references requests(id) on delete cascade,
+        pickup text, dropoff text, requester_contact text, courier_contact text
+      );
+      create table messages (
+        id uuid primary key default gen_random_uuid(),
+        request_id text not null references requests(id) on delete cascade,
+        sender_id uuid not null references auth.users(id) on delete cascade,
+        payload jsonb not null,
+        created_at timestamptz not null default now()
+      );
+      create table pubkeys (
+        user_id uuid primary key references auth.users(id) on delete cascade,
+        jwk jsonb not null
+      );
+      create table profiles (
+        user_id uuid primary key references auth.users(id) on delete cascade,
+        role text, bio text, photos jsonb
+      );
+      -- ※ すでにprofilesテーブルを作成済みの場合は、次の1行だけ追加で実行してください：
+      --    alter table profiles add column photos jsonb;
+      alter table profiles enable row level security;
+      alter table requests enable row level security;
+      alter table request_private enable row level security;
+      alter table messages enable row level security;
+      alter table pubkeys enable row level security;
+
+      create policy "req read" on requests for select using (true);
+      create policy "req insert" on requests for insert to authenticated
+        with check (requester_id = auth.uid() and status = 'open');
+      create policy "req update" on requests for update to authenticated
+        using (requester_id = auth.uid() or courier_id = auth.uid() or (status = 'open' and courier_id is null))
+        with check (requester_id = auth.uid() or courier_id = auth.uid() or (status = 'open' and courier_id is null));
+      create policy "req delete" on requests for delete to authenticated
+        using (requester_id = auth.uid() or (auth.jwt()->'app_metadata'->>'role') = 'admin');
+
+      create policy "priv read" on request_private for select to authenticated
+        using (exists (select 1 from requests r where r.id = request_id and (r.requester_id = auth.uid() or r.courier_id = auth.uid())));
+      create policy "priv insert" on request_private for insert to authenticated
+        with check (exists (select 1 from requests r where r.id = request_id and r.requester_id = auth.uid()));
+      create policy "priv update" on request_private for update to authenticated
+        using (exists (select 1 from requests r where r.id = request_id and (r.requester_id = auth.uid() or r.courier_id = auth.uid())))
+        with check (exists (select 1 from requests r where r.id = request_id and (r.requester_id = auth.uid() or r.courier_id = auth.uid())));
+
+      create policy "msg read" on messages for select to authenticated
+        using (exists (select 1 from requests r where r.id = request_id and (r.requester_id = auth.uid() or r.courier_id = auth.uid())));
+      create policy "msg insert" on messages for insert to authenticated
+        with check (sender_id = auth.uid() and exists (select 1 from requests r where r.id = request_id and (r.requester_id = auth.uid() or r.courier_id = auth.uid())));
+
+      create policy "profile read" on profiles for select using (true);
+      create policy "profile insert" on profiles for insert to authenticated with check (user_id = auth.uid());
+      create policy "profile update" on profiles for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+      create policy "key read" on pubkeys for select to authenticated using (true);
+      create policy "key insert" on pubkeys for insert to authenticated with check (user_id = auth.uid());
+      create policy "key update" on pubkeys for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+  3. 「Project Settings」→「API」の Project URL と anon public キーを下に貼り付ける
+  【管理者の設定】不適切な依頼を削除できる人を作ります。
+   1. 管理者にしたい人が、先に通常どおり新規登録する
+   2. Supabaseの「SQL Editor」で、メールアドレスを書き換えて実行する
+        update auth.users
+        set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"role":"admin"}'::jsonb
+        where email = 'kanrisha@example.com';
+   3. その人が一度ログアウトして、もう一度ログインする
+      → 名前の横に「（管理者）」と出て、マイページに「全ての依頼（管理者用）」、一覧に「削除（管理者）」が表示されます
+   ※ 管理者を外すときは： update auth.users set raw_app_meta_data = raw_app_meta_data - 'role' where email = 'kanrisha@example.com';
+  【Cloudinary（写真の保存）の設定】クレジットカードの登録は不要です。
+   1. https://cloudinary.com/users/register_free で無料アカウントを作成する
+   2. ログイン後の画面（Dashboard）に表示されている「Cloud name」を控える
+   3. 左メニューの「Settings」（歯車）→「Upload」タブ →「Upload presets」の「Add upload preset」を押す
+       ・Signing Mode を「Unsigned」にする（重要です）　・Preset name を控える（例：sakai_uploads）
+   4. 控えた Cloud name と Preset name を、下の SAKAI_CLOUDINARY_CONFIG に貼り付ける
+   ※ 無料枠を超えると、その月は写真のアップロードや表示が一時的にできなくなることがあります。
+   ※ 未設定のあいだは、写真なしで依頼を投稿できます。
+
+  【プログラム（このHTML）を更新するとき】
+   依頼・メッセージ・プロフィールは、このHTMLとは別の場所（Supabase）に保存されています。HTMLを差し替えても、データは消えません。
+   ・SQLは、「追加するもの」だけを実行してください（drop table / truncate / delete from は実行しないでください）。
+   ・【受付期限の機能を追加したとき（すでに環境がある場合は、1回だけ実行）】
+        alter table requests add column if not exists deadline timestamptz;
+   ・【任意】期限切れの依頼を、サーバー側でも15分ごとに自動で削除する（Supabaseの Database → Extensions で pg_cron を有効にしてから実行）
+        select cron.schedule('delete-expired-requests', '*/15 * * * *', $$ delete from requests where status = 'open' and deadline is not null and deadline < now() $$);
+   ※ 「この端末だけ」の簡易モードのデータは、ブラウザの中に保存されます。ページのアドレス（URL）が変わると、見えなくなります。
+
+  ※ メッセージは、各自のブラウザ内の鍵で暗号化されます（鍵はその端末にだけ保存されます）。
+  ※ 代金の支払いはアプリ内では行いません。依頼者と配送者のあいだで（現金・PayPay等）直接やり取りします。
+-->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  window.SAKAI_SUPABASE_CONFIG = {
+    url: "https://YOUR_PROJECT_REF.supabase.co",
+    key: "YOUR_ANON_PUBLIC_KEY"
+  };
+  // 写真の保存先（Cloudinary）の設定です。手順は上のコメントを見てください
+  window.SAKAI_CLOUDINARY_CONFIG = {
+    cloudName: "YOUR_CLOUD_NAME",
+    uploadPreset: "YOUR_UNSIGNED_UPLOAD_PRESET"
+  };
+</script>
+<!-- ▲▲▲ ここまで ▲▲▲ -->
+<style>
+  :root{
+    --soil:#5B4230; --soil-dark:#3E2C1F; --leaf:#3F7A4E; --leaf-dark:#2C5A38;
+    --sand:#FBF6EA; --sand-deep:#F1E8D4; --sun:#E3A335; --sun-dark:#C6841C;
+    --ink:#2B2620; --line:#E1D5B8; --white:#FFF; --danger:#B4472B;
+  }
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{ margin:0; font-family:"Hiragino Maru Gothic ProN","BIZ UDPGothic","Yu Gothic",sans-serif; background:var(--sand); color:var(--ink); line-height:1.7; font-size:17px; padding-bottom:90px; }
+  h1,h2,h3{ font-family:"Hiragino Mincho ProN","Yu Mincho",serif; margin:0 0 8px; color:var(--soil-dark); }
+  .post-title{ font-family:"Hiragino Maru Gothic ProN","BIZ UDPGothic","Yu Gothic",sans-serif; font-weight:bold; }
+
+  header.top{ background:linear-gradient(135deg,var(--leaf) 0%,var(--leaf-dark) 100%); color:var(--white); padding:18px 16px 22px; position:relative; overflow:hidden; }
+  header.top::after{ content:""; position:absolute; right:-30px; bottom:-40px; width:160px; height:160px; border-radius:50%; background:rgba(255,255,255,.08); }
+  header.top .eyebrow{ font-size:13px; letter-spacing:.12em; opacity:.85; }
+  header.top h1{ color:var(--white); font-size:26px; margin:2px 0 0; }
+  .userbar{ margin-top:12px; font-size:15px; }
+  .userbar .name{ background:rgba(255,255,255,.18); padding:6px 14px; border-radius:20px; display:inline-block; }
+
+  #authScreen{ min-height:100vh; display:flex; align-items:center; justify-content:center; background:linear-gradient(135deg,var(--leaf) 0%,var(--leaf-dark) 100%); padding:24px 16px; }
+  .auth-wrap{ width:100%; max-width:420px; }
+  .auth-wrap .eyebrow,.auth-wrap h1{ color:var(--white); text-align:center; }
+
+  .layout{ display:flex; align-items:flex-start; max-width:720px; margin:0 auto; width:100%; }
+  nav.tabs{ flex:0 0 auto; width:78px; display:flex; flex-direction:column; gap:6px; background:var(--sand-deep); padding:10px 6px; position:sticky; top:0; z-index:50; border-right:2px solid var(--line); min-height:100vh; }
+  nav.tabs button{ border:2px solid transparent; background:var(--white); color:var(--soil-dark); padding:10px 4px; border-radius:12px; font-size:12.5px; line-height:1.3; font-weight:bold; cursor:pointer; word-break:keep-all; }
+  nav.tabs button.active{ background:var(--leaf); color:var(--white); border-color:var(--leaf-dark); box-shadow:0 2px 6px rgba(44,90,56,.35); }
+  main{ flex:1 1 auto; min-width:0; padding:16px 12px; }
+  section.view{ display:none; }
+  section.view.active{ display:block; }
+
+  .card{ background:var(--white); border:1px solid var(--line); border-radius:16px; padding:16px; margin-bottom:14px; box-shadow:0 2px 6px rgba(59,45,25,.06); }
+  .card h3{ font-size:19px; }
+  .btn{ display:inline-block; background:var(--leaf); color:var(--white); border:none; padding:12px 18px; border-radius:12px; font-size:16px; font-weight:bold; cursor:pointer; text-align:center; }
+  .btn.wide{ width:100%; }
+  .btn.sun{ background:var(--sun); color:var(--soil-dark); }
+  .btn.outline{ background:var(--white); color:var(--leaf-dark); border:2px solid var(--leaf); }
+  .btn.danger{ background:var(--white); color:var(--danger); border:2px solid var(--danger); }
+  .btn.small{ padding:8px 14px; font-size:14px; border-radius:10px; }
+  .btn:disabled{ opacity:.5; }
+
+  label{ display:block; font-weight:bold; margin:12px 0 4px; font-size:15px; color:var(--soil-dark); }
+  input[type=text],input[type=number],input[type=password],select,textarea{ width:100%; padding:11px; border:2px solid var(--line); border-radius:10px; font-size:16px; font-family:inherit; background:var(--white); color:var(--ink); }
+  textarea{ min-height:80px; resize:vertical; }
+  .hint{ font-size:13px; color:#7A6B52; margin-top:2px; }
+  .meta{ font-size:13px; color:#8A7C63; margin-top:6px; }
+  .pill{ display:inline-block; font-size:12px; padding:3px 10px; border-radius:20px; background:var(--sand-deep); color:var(--soil-dark); font-weight:bold; margin-right:6px; }
+  .pill.open{ background:#E7F0E9; color:var(--leaf-dark); }
+  .pill.acc{ background:#FCE9D8; color:var(--sun-dark); }
+  .pill.done{ background:var(--leaf); color:var(--white); }
+  .pill.x{ background:#EEE; color:#777; }
+  .fee{ font-size:22px; font-weight:bold; color:var(--sun-dark); }
+  .route{ font-size:15px; margin:4px 0; }
+  .detail{ margin-top:10px; padding:10px 12px; background:var(--sand); border:1px solid var(--line); border-radius:12px; font-size:15px; }
+  .row{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .empty-state{ text-align:center; color:#8A7C63; padding:30px 10px; }
+  .notice-limit{ font-size:13px; background:#FFF6E5; border:1px solid #F0DDA6; color:#7A5A12; padding:10px 12px; border-radius:10px; margin-bottom:14px; }
+  .notice-limit.err{ background:#FCEAE6; border-color:#E7B8AC; color:#7A2E1A; }
+  .stats{ display:flex; gap:8px; flex-wrap:wrap; }
+  .stat{ flex:1 1 130px; background:var(--sand); border:1px solid var(--line); border-radius:12px; padding:10px 12px; }
+  .stat b{ display:block; font-size:20px; color:var(--leaf-dark); }
+
+  .fab{ position:fixed; right:18px; bottom:18px; z-index:60; background:var(--sun); color:var(--soil-dark); width:64px; height:64px; border-radius:50%; border:none; font-size:30px; box-shadow:0 4px 12px rgba(0,0,0,.25); cursor:pointer; }
+  .modal-bg{ display:none; position:fixed; inset:0; background:rgba(40,30,15,.5); z-index:100; align-items:flex-end; justify-content:center; }
+  .modal-bg.active{ display:flex; }
+  .modal{ background:var(--sand); width:100%; max-width:720px; max-height:90vh; overflow-y:auto; border-radius:20px 20px 0 0; padding:20px; }
+  .modal h2{ display:flex; justify-content:space-between; align-items:center; }
+  .close-x{ background:none; border:none; font-size:26px; color:var(--soil); cursor:pointer; }
+  .type-choice{ display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
+  .type-choice button{ flex:1; min-width:100px; padding:12px; border-radius:12px; border:2px solid var(--line); background:var(--white); font-size:15px; font-weight:bold; cursor:pointer; color:var(--soil); }
+  .type-choice button.sel{ border-color:var(--leaf); background:#E7F0E9; color:var(--leaf-dark); }
+  .nav-dot{ display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--danger); margin-left:4px; vertical-align:top; }
+  .dm-modal{ display:flex; flex-direction:column; height:80vh; height:80dvh; }
+  .dm-thread{ flex:1 1 auto; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding:6px 2px; }
+  .dm-thread > div:first-child{ margin-top:auto; }
+  .dm-row{ display:flex; } .dm-row.me{ justify-content:flex-end; }
+  .dm-bubble{ max-width:82%; padding:10px 14px; border-radius:16px; font-size:15px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--sand-deep); }
+  .dm-row.me .dm-bubble{ background:var(--leaf); color:var(--white); }
+  .dm-time{ font-size:11px; color:#9A8C70; margin-top:2px; }
+  .dm-row.me .dm-time{ text-align:right; }
+  .dm-input-row{ display:flex; gap:8px; align-items:flex-end; border-top:1px solid var(--line); padding-top:10px; margin-top:10px; }
+  .dm-input-row textarea{ flex:1; min-height:44px; resize:none; }
+  .convo{ display:flex; align-items:center; gap:10px; cursor:pointer; }
+  .terms-body{ font-size:14px; line-height:1.8; }
+  .terms-body h3{ font-size:15px; margin:12px 0 2px; }
+  input[type=file]{ padding:8px; font-size:14px; }
+  .img-preview-wrap{ position:relative; display:inline-block; margin:4px 6px 4px 0; }
+  .img-preview-wrap img{ width:82px; height:82px; object-fit:cover; border-radius:12px; border:1px solid var(--line); display:block; }
+  .img-preview-wrap button{ position:absolute; top:6px; right:6px; background:rgba(40,30,15,.7); color:var(--white); border:none; border-radius:50%; width:26px; height:26px; font-size:15px; cursor:pointer; }
+  .req-photos{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .req-photos a{ width:calc(50% - 3px); }
+  .req-photos img{ width:100%; aspect-ratio:1; object-fit:cover; border-radius:12px; border:1px solid var(--line); display:block; }
+  .req-photos.mini a{ width:64px; }
+  button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{ outline:3px solid var(--sun-dark); outline-offset:1px; }
+</style>
+</head>
+<body>
+
+<!-- ログイン画面 -->
+<div id="authScreen" style="display:none;">
+  <div class="auth-wrap">
+    <div class="eyebrow">大阪府 堺市</div>
+    <h1>やさい配送ひろば</h1>
+    <div class="card" style="margin-top:16px;">
+      <div class="type-choice">
+        <button type="button" id="authTabLogin" class="sel">ログイン</button>
+        <button type="button" id="authTabSignup">新規登録</button>
+      </div>
+      <div id="authSignupNameField" style="display:none;">
+        <label>表示する名前</label>
+        <input type="text" id="authDisplayName" placeholder="例：山田さん、〇〇農園、〇〇食堂">
+      </div>
+      <label>メールアドレス</label>
+      <input type="text" id="authEmail" placeholder="example@mail.com">
+      <label>パスワード（6文字以上）</label>
+      <input type="password" id="authPassword">
+      <div id="authTermsField" style="display:none; margin-top:12px;">
+        <label style="display:flex; align-items:flex-start; gap:8px; font-weight:normal;">
+          <input type="checkbox" id="authTermsCheck" style="width:20px; height:20px; margin-top:2px;">
+          <span><button type="button" id="openTermsFromAuth" class="btn small outline" style="padding:4px 10px;">利用規約</button> に同意します</span>
+        </label>
+      </div>
+      <div id="authError" style="margin-top:10px;"></div>
+      <button class="btn wide sun" id="authSubmitBtn" style="margin-top:12px;">ログインする</button>
+      <p class="hint" style="margin-top:10px;">新規登録の場合、確認メールが届くことがあります。</p>
+      <button class="btn wide outline" id="authBackBtn" style="margin-top:10px;">登録せずに閲覧に戻る</button>
+    </div>
+  </div>
+</div>
+
+<div id="appRoot" style="display:none;">
+<header class="top">
+  <div class="eyebrow">大阪府 堺市</div>
+  <h1>やさい配送ひろば</h1>
+  <div class="userbar"><span class="name" id="userNameDisplay"></span></div>
+</header>
+<div id="storageModeBanner"></div>
+
+<div class="layout">
+<nav class="tabs" id="tabs">
+  <button data-view="board" class="active">依頼<br>一覧</button>
+  <button data-view="mine">進行中<br>の配送</button>
+  <button data-view="messages">メッセージ<span id="msgDot" class="nav-dot" style="display:none;"></span></button>
+  <button data-view="mypage">マイページ</button>
+</nav>
+<main>
+  <!-- 依頼一覧 -->
+  <section class="view active" id="view-board">
+    <div class="card">
+      <h3>配送を待っている依頼</h3>
+      <p class="hint">農家さん・飲食店さんの「野菜を届けてほしい」という依頼です。請け負うと、住所と連絡先が見られます。</p>
+      <label>お届け先の区で絞り込む</label>
+      <select id="filterWard"></select>
+    </div>
+    <div id="boardList"></div>
+  </section>
+
+  <!-- 進行中 -->
+  <section class="view" id="view-mine">
+    <div id="mineLogin" class="card" style="display:none;">
+      <p class="hint">依頼の投稿・請け負いには、ログイン（会員登録）が必要です。</p>
+      <button class="btn wide sun" id="mineLoginBtn">ログイン・新規登録する</button>
+    </div>
+    <div id="mineBody">
+      <h3 class="post-title">あなたが請け負った配送</h3>
+      <div id="jobList"></div>
+      <h3 class="post-title" style="margin-top:20px;">あなたが出した依頼</h3>
+      <div id="myReqList"></div>
+    </div>
+  </section>
+
+  <!-- メッセージ -->
+  <section class="view" id="view-messages">
+    <div id="msgLogin" class="card" style="display:none;">
+      <p class="hint">メッセージには、ログイン（会員登録）が必要です。</p>
+      <button class="btn wide sun" id="msgLoginBtn">ログイン・新規登録する</button>
+    </div>
+    <div class="card" id="msgBody">
+      <h3>メッセージ</h3>
+      <p class="hint">配送者が決まった依頼ごとに、依頼者と配送者のお二人でやり取りできます。内容は暗号化され、お二人以外（管理者を含む）には読めません。1つのブラウザでご利用ください。</p>
+      <div id="inboxList"></div>
+    </div>
+  </section>
+
+  <!-- マイページ -->
+  <section class="view" id="view-mypage">
+    <div id="mypageLogin" class="card" style="display:none;">
+      <h3>ログイン・新規登録</h3>
+      <p class="hint">依頼の投稿や配送の請け負いには、ログイン（会員登録）が必要です。閲覧だけなら登録なしでもできます。</p>
+      <button class="btn wide sun" id="mypageLoginBtn">ログイン・新規登録する</button>
+    </div>
+    <div id="mypageBody">
+      <div class="card">
+        <h3><span id="mypageName"></span>さんのページ</h3>
+        <div class="stats" id="statsBox"></div>
+        <label>表示する名前</label>
+        <input type="text" id="mypageNameInput">
+        <button class="btn wide" id="nameSaveBtn" style="margin-top:10px;">この名前に変更する</button>
+        <button class="btn wide outline" id="logoutBtn" style="display:none; margin-top:10px;">ログアウト</button>
+        <button class="btn wide outline" id="openTermsBtn" style="margin-top:10px;">利用規約を見る</button>
+      </div>
+      <div class="card" id="profileCard">
+        <h3>プロフィール</h3>
+        <label>あなたは</label>
+        <div class="type-choice" id="profRoleChoice">
+          <button type="button" data-v="農家">農家</button>
+          <button type="button" data-v="飲食店">飲食店</button>
+          <button type="button" data-v="配達人">配達人</button>
+        </div>
+        <label>自己紹介</label>
+        <textarea id="profBio" maxlength="300" placeholder="例：南区で水なすを作っています。朝採れを新鮮なうちに届けたいです。"></textarea>
+        <p class="hint">依頼や配送の相手に表示されます（300字まで）。</p>
+        <div id="profAddrBox" style="display:none;">
+          <label>あなたの住所（依頼を出すとき、自動で入力されます）</label>
+          <select id="profWard"></select>
+          <input type="text" id="profAddr" placeholder="例：〇〇町1-2-3（〇〇農園）" style="margin-top:6px;">
+          <p class="hint">住所は、あなたが依頼を出して、配送者が決まったあとに、その配送者にだけ表示されます。</p>
+          <label>農場・お店の写真（あれば）</label>
+          <input type="file" id="profImageInput" accept="image/*" multiple>
+          <p class="hint">最大4枚まで。依頼の相手に表示されます。</p>
+          <div id="profImagePreviewBox"></div>
+        </div>
+        <button class="btn wide" id="profSaveBtn" style="margin-top:10px;">プロフィールを保存する</button>
+      </div>
+      <div class="card" id="adminCard" style="display:none;">
+        <h3>全ての依頼（管理者用）</h3>
+        <p class="hint">不適切な依頼を削除できます。メッセージの内容は管理者にも表示されません。</p>
+        <div id="adminList"></div>
+      </div>
+      <div class="card">
+        <h3>ご利用の流れ</h3>
+        <p class="hint" style="font-size:14px; line-height:1.8;">
+          1. 農家・飲食店が、届けたい野菜と報酬を決めて依頼を投稿<br>
+          2. 配送できる人が依頼を請け負う（先に請け負った人に決まります）<br>
+          3. 集荷 → 配達 → 配達完了にする<br>
+          4. 依頼者が報酬を支払い、「支払い済み」にして完了<br>
+          ※ 報酬の支払いはアプリ内では行いません。現金・PayPayなど、お二人で決めた方法で直接お支払いください。
+        </p>
+      </div>
+    </div>
+  </section>
+</main>
+</div>
+</div>
+
+<button class="fab" id="newReqFab" title="配送を依頼する">＋</button>
+
+<!-- 依頼投稿 -->
+<div class="modal-bg" id="reqModalBg">
+  <div class="modal">
+    <h2><span id="reqModalTitle">配送を依頼する</span> <button class="close-x" id="closeReqModal">×</button></h2>
+    <label>あなたは</label>
+    <div class="type-choice" id="reqRoleChoice">
+      <button type="button" data-v="農家" class="sel">農家</button>
+      <button type="button" data-v="飲食店">飲食店</button>
+    </div>
+    <p class="hint">マイページのプロフィールに住所を登録すると、あなたの住所が自動で入ります。</p>
+    <label>届けてほしい野菜</label>
+    <input type="text" id="reqItem" placeholder="例：水なす、新玉ねぎ">
+    <label>数量・大きさ</label>
+    <input type="text" id="reqQty" placeholder="例：10kg入り段ボール 3箱">
+    <label>集荷先（取りに来てほしい場所）</label>
+    <select id="reqPickupWard"></select>
+    <input type="text" id="reqPickup" placeholder="例：〇〇町1-2-3（〇〇農園）" style="margin-top:6px;">
+    <label>お届け先</label>
+    <select id="reqDropWard"></select>
+    <input type="text" id="reqDrop" placeholder="例：〇〇町4-5-6（〇〇食堂）" style="margin-top:6px;">
+    <label>希望日時</label>
+    <input type="text" id="reqWhen" placeholder="例：11/20 午前中、毎週火曜の朝">
+    <label>受付期限（この日時までに請け負われなければ、依頼は自動で消えます）</label>
+    <input type="datetime-local" id="reqDeadline">
+    <label>配送の報酬（円）</label>
+    <input type="number" id="reqFee" min="1" step="50" placeholder="例：1500">
+    <label>連絡先（請け負った人にだけ表示されます）</label>
+    <input type="text" id="reqContact" placeholder="例：090-xxxx-xxxx">
+    <label>備考（あれば）</label>
+    <textarea id="reqNote" placeholder="例：傷みやすいので保冷バッグがあると助かります"></textarea>
+    <label>野菜の写真（あれば）</label>
+    <input type="file" id="reqImageInput" accept="image/*" multiple>
+    <p class="hint">写真は最大4枚まで。配送者が荷物の量や種類を確認しやすくなります。</p>
+    <div id="reqImagePreviewBox"></div>
+    <button class="btn wide sun" id="postReqBtn" style="margin-top:12px;">この内容で依頼を出す</button>
+  </div>
+</div>
+
+<!-- メッセージ -->
+<div class="modal-bg" id="dmModalBg">
+  <div class="modal dm-modal">
+    <h2><span id="dmTitle"></span> <button class="close-x" id="closeDm">×</button></h2>
+    <div class="hint" id="dmSub"></div>
+    <div class="dm-thread" id="dmThread"></div>
+    <div class="dm-input-row">
+      <textarea id="dmInput" maxlength="500" placeholder="メッセージを入力（500字まで）"></textarea>
+      <button class="btn" id="dmSend">送信</button>
+    </div>
+  </div>
+</div>
+
+<!-- 利用規約 -->
+<div class="modal-bg" id="termsModalBg">
+  <div class="modal">
+    <h2>利用規約 <button class="close-x" id="closeTerms">×</button></h2>
+    <div class="terms-body">
+      <p>「堺市 やさい配送ひろば」（以下「本サービス」）は、堺市内の農家・飲食店と、野菜の配送を請け負う人を結びつける場です。ご利用の前に、次の内容をお読みください。</p>
+      <h3>1. サービスの内容</h3>
+      <p>本サービスは、配送の依頼と請け負いの連絡の場を提供するものです。運営者は、依頼者と配送者のあいだの契約の当事者ではありません。</p>
+      <h3>2. 報酬の支払い</h3>
+      <p>報酬の金額・支払い方法・時期は、依頼者と配送者がそれぞれ責任をもって守ってください。本サービスは代金の決済や立て替えを行いません。支払いをめぐるトラブルについて、運営者は責任を負いません。</p>
+      <h3>3. 野菜の取り扱い</h3>
+      <p>配送者は、野菜を傷めないよう丁寧に扱い、約束した日時に届けてください。破損・遅延・紛失などの責任と対応は、当事者同士で話し合って解決してください。食品の衛生管理にも十分ご注意ください。</p>
+      <h3>4. 請け負いと取り消し</h3>
+      <p>請け負った配送は、やむを得ない場合を除き、責任をもって完了させてください。辞退する場合は、集荷の前に、アプリ上で辞退し、依頼者へ連絡してください。</p>
+      <h3>5. 個人情報</h3>
+      <p>住所・連絡先は、配送の目的以外には使わないでください。他の人の情報を、許可なく公開・転用してはいけません。</p>
+      <h3>6. 禁止事項</h3>
+      <p>虚偽の依頼や登録、法令に反する物の配送、他の利用者への迷惑行為・嫌がらせ・脅迫、不当な金銭の要求、運営を妨げる行為を禁止します。</p>
+      <h3>7. 投稿の削除・利用の停止</h3>
+      <p>規約に反する依頼やメッセージがあった場合、運営者は、予告なく削除したり、利用をお断りしたりすることがあります。</p>
+      <h3>8. メッセージについて</h3>
+      <p>メッセージは、依頼者と配送者の連絡のためのものです。メッセージは、各自のブラウザ内の鍵で暗号化され、依頼者と配送者のお二人だけが読めます。ただし鍵は、そのブラウザにだけ保存されます。別の端末・ブラウザや、ブラウザのデータを消した後は、過去のメッセージが読めなくなります。</p>
+      <h3>9. 免責・変更</h3>
+      <p>運営者は、本サービスの利用によって生じた損害について、故意または重大な過失がある場合を除き、責任を負いません。本規約は、必要に応じて変更することがあります。</p>
+    </div>
+    <button class="btn wide" id="closeTerms2" style="margin-top:14px;">閉じる</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const WARDS = ['堺区','中区','東区','西区','南区','北区','美原区'];
+  const STATUS = {
+    open:['募集中','open'], accepted:['配送者が決まりました','acc'], picked:['配送中','acc'],
+    delivered:['配達完了・支払い待ち','acc'], paid:['完了','done'], cancelled:['取り消し','x']
+  };
+  let sb = null, authUser = null, me = 'ゲスト', reqs = [], role = '農家', prof = {}, profMap = {};
+
+  const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+  const yen = n => '¥' + Number(n||0).toLocaleString('ja-JP');
+  const fmt = ts => { const d=new Date(ts); return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; };
+
+  // ---------- 保存（依頼は1件ずつ別の行／未設定ならこの端末だけ） ----------
+  function initBackend(){
+    try{
+      const c = window.SAKAI_SUPABASE_CONFIG;
+      if(!c || !c.url || !c.key || c.key==='YOUR_ANON_PUBLIC_KEY' || typeof supabase==='undefined') return false;
+      sb = supabase.createClient(c.url, c.key); return true;
+    }catch(e){ console.warn(e); sb = null; return false; }
+  }
+  const myId = () => authUser ? authUser.id : 'local';
+  const lsGet = k => { try{ return JSON.parse(localStorage.getItem('sakai_local_'+k)); }catch(e){ return null; } };
+  const lsSet = (k,v) => { try{ localStorage.setItem('sakai_local_'+k, JSON.stringify(v)); return true; }catch(e){ return false; } };
+  const ukey = k => (authUser ? 'u_'+authUser.id+'_' : '') + k;
+  const sGet = async k => lsGet(ukey(k));
+  const sSet = async (k,v) => lsSet(ukey(k), v);
+
+  // 公開してよい項目だけを data に入れる（住所・連絡先は request_private に別保存）
+  const PUB = ['images','role','requester','item','qty','pickupWard','dropWard','when','fee','note','courier','created','pickedAt','deliveredAt','paidAt'];
+  const dataOf = r => { const d={}; PUB.forEach(k=>{ if(r[k]!==undefined) d[k]=r[k]; }); return d; };
+
+  async function reload(){
+    if(!sb){ reqs = lsGet('reqs') || []; profMap = {local:prof}; await sweepExpired(); return; }
+    const [a,b,c] = await Promise.all([ sb.from('requests').select('*').order('created_at',{ascending:false}), sb.from('request_private').select('*'), sb.from('profiles').select('user_id,role,bio,photos') ]);
+    profMap = {}; (c.data||[]).forEach(x=>{ profMap[x.user_id] = {role:x.role, bio:x.bio, photos:x.photos}; });
+    if(a.error){ console.warn(a.error); return; }
+    const priv = {}; (b.data||[]).forEach(p=>{ priv[p.request_id] = {pickup:p.pickup, drop:p.dropoff, contact:p.requester_contact, courierContact:p.courier_contact}; });
+    reqs = a.data.map(x=>({ ...x.data, id:x.id, status:x.status, requesterId:x.requester_id, courierId:x.courier_id, deadline:x.deadline ? Date.parse(x.deadline) : null, priv:priv[x.id]||null }));
+    await sweepExpired();
+    await loadMsgMeta();
+  }
+  async function insertReq(r, priv){
+    if(!sb){ reqs.push({...r, requesterId:'local', priv}); return lsSet('reqs', reqs); }
+    const a = await sb.from('requests').insert({id:r.id, requester_id:authUser.id, status:'open', deadline:new Date(r.deadline).toISOString(), data:dataOf(r)});
+    if(a.error){ console.warn(a.error); return false; }
+    const b = await sb.from('request_private').insert({request_id:r.id, pickup:priv.pickup, dropoff:priv.drop, requester_contact:priv.contact});
+    if(b.error){ console.warn(b.error); await sb.from('requests').delete().eq('id', r.id); return false; }
+    return true;
+  }
+  // 1件の行だけを、「いまの状態が from のときだけ」書き換える（同時に押されても二重に請け負われません）
+  async function transition(id, from, mut, after){
+    await reload();
+    const r = reqs.find(x=>x.id===id);
+    if(!r){ alert('この依頼は見つかりませんでした。'); return render(); }
+    if(r.status!==from){ alert('この依頼の状態が変わっています（他の方が先に操作した可能性があります）。'); return render(); }
+    const n = {...r}, msg = mut(n);
+    if(msg){ alert(msg); return render(); }
+    let ok = false;
+    if(sb){
+      const {data,error} = await sb.from('requests').update({status:n.status, courier_id:n.courierId||null, data:dataOf(n)}).eq('id',id).eq('status',from).select('id');
+      if(error) console.warn(error);
+      ok = !error && !!data && data.length>0;
+    } else {
+      const all = lsGet('reqs')||[], i = all.findIndex(x=>x.id===id);
+      if(i>=0 && all[i].status===from){ all[i] = n; ok = lsSet('reqs', all); }
+    }
+    if(!ok) alert('この依頼はすでに他の方が操作したか、保存に失敗しました。最新の状態を表示します。');
+    else if(after) await after(n);
+    await reload(); render();
+  }
+  // 期限切れ（受付期限を過ぎても請け負われなかった依頼）は、一覧から外し、自分の依頼（管理者は全て）は削除する
+  const isExpired = r => r.status==='open' && !!r.deadline && r.deadline < Date.now();
+  async function sweepExpired(){
+    const dead = reqs.filter(isExpired);
+    if(!dead.length) return;
+    for(const r of dead){ if(r.requesterId===myId() || isAdmin()) await removeReq(r.id); }
+    reqs = reqs.filter(r=>!isExpired(r));
+  }
+  async function updateReq(id, n, priv){
+    if(!sb){
+      const all = lsGet('reqs')||[], i = all.findIndex(x=>x.id===id);
+      if(i<0 || all[i].status!=='open') return false;
+      all[i] = {...all[i], ...n, priv}; return lsSet('reqs', all);
+    }
+    const a = await sb.from('requests').update({data:dataOf(n), deadline:new Date(n.deadline).toISOString()}).eq('id',id).eq('status','open').select('id');
+    if(a.error || !a.data || !a.data.length){ if(a.error) console.warn(a.error); return false; }
+    const b = await sb.from('request_private').update({pickup:priv.pickup, dropoff:priv.drop, requester_contact:priv.contact}).eq('request_id', id);
+    if(b.error) console.warn(b.error);
+    return !b.error;
+  }
+  async function removeReq(id){
+    if(sb){ const {error} = await sb.from('requests').delete().eq('id', id); if(error){ console.warn(error); return false; } return true; }
+    return lsSet('reqs', (lsGet('reqs')||[]).filter(x=>x.id!==id));
+  }
+
+  const isAdmin = () => !!(sb && authUser && authUser.app_metadata && authUser.app_metadata.role === 'admin');
+  const isGuest = () => !!(sb && !authUser);
+  function requireLogin(msg){
+    if(isGuest()){ alert(msg || 'この操作には、ログイン（会員登録）が必要です。'); showAuth(); return false; }
+    return true;
+  }
+
+  // ---------- 画面切り替え ----------
+  function showApp(){ $('authScreen').style.display='none'; $('appRoot').style.display=''; }
+  function showAuth(){ $('authScreen').style.display='flex'; $('appRoot').style.display='none'; }
+  $('authBackBtn').onclick = showApp;
+  $('mineLoginBtn').onclick = showAuth;
+  $('mypageLoginBtn').onclick = showAuth;
+  $('msgLoginBtn').onclick = showAuth;
+
+  $('tabs').addEventListener('click', e=>{
+    const b = e.target.closest('button[data-view]'); if(!b) return;
+    document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('active', x===b));
+    document.querySelectorAll('section.view').forEach(s=>s.classList.toggle('active', s.id==='view-'+b.dataset.view));
+    render();
+  });
+
+  // ---------- 利用規約 ----------
+  const termsOpen = ()=> $('termsModalBg').classList.add('active');
+  const termsClose = ()=> $('termsModalBg').classList.remove('active');
+  $('openTermsBtn').onclick = termsOpen; $('openTermsFromAuth').onclick = termsOpen;
+  $('closeTerms').onclick = termsClose; $('closeTerms2').onclick = termsClose;
+
+  // ---------- ログイン ----------
+  let authMode = 'login';
+  function authTabs(){
+    $('authTabLogin').classList.toggle('sel', authMode==='login');
+    $('authTabSignup').classList.toggle('sel', authMode==='signup');
+    $('authSignupNameField').style.display = authMode==='signup' ? '' : 'none';
+    $('authTermsField').style.display = authMode==='signup' ? '' : 'none';
+    $('authSubmitBtn').textContent = authMode==='signup' ? '新規登録する' : 'ログインする';
+    $('authError').innerHTML = '';
+  }
+  $('authTabLogin').onclick = ()=>{ authMode='login'; authTabs(); };
+  $('authTabSignup').onclick = ()=>{ authMode='signup'; authTabs(); };
+  $('authSubmitBtn').onclick = async ()=>{
+    const email = $('authEmail').value.trim(), password = $('authPassword').value, err = $('authError');
+    err.innerHTML = '';
+    if(!sb){ err.innerHTML = '<div class="notice-limit err">Supabaseが未設定のため、ログインは使えません。</div>'; return; }
+    if(!email || !password){ err.innerHTML = '<div class="notice-limit err">メールアドレスとパスワードを入力してください</div>'; return; }
+    const btn = $('authSubmitBtn'); btn.disabled = true;
+    try{
+      if(authMode==='signup'){
+        const name = $('authDisplayName').value.trim();
+        if(!name){ err.innerHTML = '<div class="notice-limit err">表示する名前を入力してください</div>'; btn.disabled=false; return; }
+        if(!$('authTermsCheck').checked){ err.innerHTML = '<div class="notice-limit err">利用規約に同意していただく必要があります</div>'; btn.disabled=false; return; }
+        const {data,error} = await sb.auth.signUp({email, password, options:{data:{display_name:name}}});
+        if(error) throw error;
+        if(data.session){ authUser = data.user; showApp(); await init(); }
+        else err.innerHTML = '<div class="notice-limit">確認メールを送信しました。メール内のリンクを開いてから、ログインしてください。</div>';
+      } else {
+        const {data,error} = await sb.auth.signInWithPassword({email, password});
+        if(error) throw error;
+        authUser = data.user; showApp(); await init();
+      }
+    }catch(e){ err.innerHTML = `<div class="notice-limit err">${esc((e&&e.message)||'エラーが発生しました')}</div>`; }
+    btn.disabled = false;
+  };
+  $('logoutBtn').onclick = async ()=>{ if(confirm('ログアウトしますか？')){ try{ await sb.auth.signOut(); }catch(e){} } };
+
+  // ---------- プロフィール（種類・自己紹介は公開、住所は本人だけ） ----------
+  async function loadProfile(){
+    prof = (await sGet('profile2')) || {};
+    if(sb && authUser){
+      const m = authUser.user_metadata || {};
+      if(m.addr !== undefined){ prof.ward = m.addr_ward; prof.addr = m.addr; }
+      const {data} = await sb.from('profiles').select('role,bio,photos').eq('user_id', authUser.id).maybeSingle();
+      if(data){ prof.role = data.role; prof.bio = data.bio; prof.photos = data.photos || []; }
+    }
+  }
+  let profRole = '', profUrls = [], profBlobs = [];
+  function renderProfPhotos(){
+    const box = $('profImagePreviewBox');
+    box.innerHTML = profUrls.filter(u=>u.startsWith('https://res.cloudinary.com/')).map((u,i)=>`<div class="img-preview-wrap"><img src="${esc(u)}" alt=""><button type="button" data-u="${i}" aria-label="写真を外す">×</button></div>`).join('')
+      + profBlobs.map((b,i)=>`<div class="img-preview-wrap"><img src="${URL.createObjectURL(b)}" alt=""><button type="button" data-b="${i}" aria-label="写真を外す">×</button></div>`).join('');
+    box.querySelectorAll('[data-u]').forEach(x=>{ x.onclick = ()=>{ profUrls.splice(Number(x.dataset.u),1); renderProfPhotos(); }; });
+    box.querySelectorAll('[data-b]').forEach(x=>{ x.onclick = ()=>{ profBlobs.splice(Number(x.dataset.b),1); renderProfPhotos(); }; });
+  }
+  $('profImageInput').addEventListener('change', async e=>{
+    const files = Array.from(e.target.files||[]); e.target.value = '';
+    const room = MAX_IMAGES - profUrls.length - profBlobs.length;
+    if(!files.length) return;
+    if(room<=0) return alert('写真は最大'+MAX_IMAGES+'枚までです。');
+    if(files.length>room) alert('残り'+room+'枚まで追加できます。最初の'+room+'枚を追加します。');
+    for(const f of files.slice(0, room)){
+      if(!f.type.startsWith('image/')) continue;
+      try{ profBlobs.push(await compressImage(f, 900, 0.6)); }catch(err){ console.warn(err); }
+    }
+    renderProfPhotos();
+  });
+  function showProfAddr(){ $('profAddrBox').style.display = (profRole==='農家' || profRole==='飲食店') ? '' : 'none'; }
+  function renderProfile(){
+    profRole = prof.role || '';
+    document.querySelectorAll('#profRoleChoice button').forEach(b=>b.classList.toggle('sel', b.dataset.v===profRole));
+    $('profBio').value = prof.bio || '';
+    $('profWard').value = prof.ward || WARDS[0]; $('profAddr').value = prof.addr || '';
+    profUrls = (prof.photos||[]).slice(); profBlobs = []; renderProfPhotos();
+    showProfAddr();
+  }
+  $('profRoleChoice').addEventListener('click', e=>{
+    const b = e.target.closest('button'); if(!b) return;
+    profRole = b.dataset.v;
+    document.querySelectorAll('#profRoleChoice button').forEach(x=>x.classList.toggle('sel', x===b));
+    showProfAddr();
+  });
+  $('profSaveBtn').onclick = async ()=>{
+    if(!profRole) return alert('農家・飲食店・配達人のどれかを選んでください。');
+    const shop = profRole!=='配達人';
+    const btn = $('profSaveBtn'); btn.disabled = true;
+    let photos = shop ? profUrls.slice() : [];
+    if(shop && profBlobs.length){
+      if(!cloudOk()){
+        if(!confirm('写真の保存先（Cloudinary）がまだ設定されていません。新しく選んだ写真なしで保存しますか？')){ btn.disabled = false; return; }
+      } else {
+        const up = await uploadImages(profBlobs);
+        if(up.length < profBlobs.length && !confirm('写真のアップロードに失敗したものがあります（'+up.length+'/'+profBlobs.length+'枚）。この枚数で保存しますか？')){ btn.disabled = false; return; }
+        photos = photos.concat(up);
+      }
+    }
+    const np = { role:profRole, bio:$('profBio').value.trim().slice(0,300), ward: shop ? $('profWard').value : '', addr: shop ? $('profAddr').value.trim() : '', photos: photos.slice(0, MAX_IMAGES) };
+    await sSet('profile2', np); prof = np;
+    if(sb && authUser){
+      const a = await sb.from('profiles').upsert({user_id:authUser.id, role:np.role, bio:np.bio, photos:np.photos});
+      if(a.error){ console.warn(a.error); alert('プロフィールの保存に失敗しました。profilesテーブルを作成済みか確認してください。'); }
+      try{ await sb.auth.updateUser({data:{addr_ward:np.ward, addr:np.addr}}); }catch(e){ console.warn(e); }
+    }
+    btn.disabled = false;
+    profUrls = np.photos.slice(); profBlobs = []; renderProfPhotos();
+    await reload(); render(); alert('プロフィールを保存しました。');
+  };
+
+  async function setName(n){
+    me = n.trim();
+    await sSet('profile', {username:me}, false);
+    if(sb && authUser){ try{ await sb.auth.updateUser({data:{display_name:me}}); }catch(e){ console.warn(e); } }
+    renderUser(); render();
+  }
+  $('nameSaveBtn').onclick = ()=>{ const n=$('mypageNameInput').value; if(!n.trim()) return alert('名前を入力してください'); setName(n); };
+  function renderUser(){ $('userNameDisplay').textContent = 'ようこそ、' + me + 'さん' + (isAdmin() ? '（管理者）' : ''); }
+
+  // ---------- 依頼の投稿 ----------
+  function fillWards(sel, withAll){
+    sel.innerHTML = (withAll?'<option value="all">すべての区</option>':'') + WARDS.map(w=>`<option>${w}</option>`).join('');
+  }
+  fillWards($('profWard')); fillWards($('filterWard'), true); fillWards($('reqPickupWard')); fillWards($('reqDropWard'));
+  $('filterWard').onchange = renderBoard;
+
+  // 農家は「集荷先」、飲食店は「お届け先」に、登録した自分の住所を入れる
+  function applyAddr(){
+    if(!prof.addr) return;
+    const w = prof.ward || WARDS[0];
+    if(role==='農家'){ $('reqPickupWard').value = w; $('reqPickup').value = prof.addr; if($('reqDrop').value===prof.addr) $('reqDrop').value=''; }
+    else { $('reqDropWard').value = w; $('reqDrop').value = prof.addr; if($('reqPickup').value===prof.addr) $('reqPickup').value=''; }
+  }
+  function setReqRole(v){
+    role = v;
+    document.querySelectorAll('#reqRoleChoice button').forEach(x=>x.classList.toggle('sel', x.dataset.v===v));
+    if(!editId) applyAddr();
+  }
+  $('reqRoleChoice').addEventListener('click', e=>{ const b = e.target.closest('button'); if(b) setReqRole(b.dataset.v); });
+  $('newReqFab').onclick = ()=>{
+    if(!requireLogin('配送の依頼には、ログイン（会員登録）が必要です。')) return;
+    if(editId || !$('reqDeadline').value) resetReqForm();
+    setReqRole(prof.role==='飲食店' ? '飲食店' : prof.role==='農家' ? '農家' : role);
+    $('reqModalBg').classList.add('active');
+  };
+  $('closeReqModal').onclick = ()=>{ $('reqModalBg').classList.remove('active'); if(editId) resetReqForm(); };
+
+  // ---------- 写真（縮小してCloudinaryに保存） ----------
+  const MAX_IMAGES = 4;
+  function compressImage(file, maxDim, quality){
+    return new Promise((resolve, reject)=>{
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('読み込みに失敗しました'));
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = () => reject(new Error('画像を読み込めませんでした'));
+        img.onload = () => {
+          let w = img.width, h = img.height;
+          if(w > h && w > maxDim){ h = Math.round(h * maxDim / w); w = maxDim; }
+          else if(h > maxDim){ w = Math.round(w * maxDim / h); h = maxDim; }
+          const c = document.createElement('canvas'); c.width = w; c.height = h;
+          c.getContext('2d').drawImage(img, 0, 0, w, h);
+          c.toBlob(b=> b ? resolve(b) : reject(new Error('画像の変換に失敗しました')), 'image/jpeg', quality);
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+  let reqImages = [], reqUrls = [], editId = null;
+  const toLocalInput = ms => { const d = new Date(ms), p = n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
+  function renderReqPreview(){
+    const box = $('reqImagePreviewBox');
+    box.innerHTML = reqUrls.map((u,i)=>`<div class="img-preview-wrap"><img src="${esc(u)}" alt=""><button type="button" data-u="${i}" aria-label="写真を外す">×</button></div>`).join('')
+      + reqImages.map((b,i)=>`<div class="img-preview-wrap"><img src="${URL.createObjectURL(b)}" alt=""><button type="button" data-b="${i}" aria-label="写真を外す">×</button></div>`).join('');
+    box.querySelectorAll('[data-u]').forEach(x=>{ x.onclick = ()=>{ reqUrls.splice(Number(x.dataset.u),1); renderReqPreview(); }; });
+    box.querySelectorAll('[data-b]').forEach(x=>{ x.onclick = ()=>{ reqImages.splice(Number(x.dataset.b),1); renderReqPreview(); }; });
+  }
+  function resetReqForm(){
+    ['reqItem','reqQty','reqPickup','reqDrop','reqWhen','reqFee','reqNote'].forEach(id=>$(id).value='');
+    $('reqDeadline').value = toLocalInput(Date.now() + 864e5);
+    reqImages = []; reqUrls = []; editId = null; renderReqPreview();
+    $('reqModalTitle').textContent = '配送を依頼する'; $('postReqBtn').textContent = 'この内容で依頼を出す';
+  }
+  function openEdit(id){
+    const r = reqs.find(x=>x.id===id);
+    if(!r || r.requesterId!==myId() || r.status!=='open') return alert('この依頼は編集できません。請け負われたあとは、メッセージで配送者と相談してください。');
+    const pv = r.priv || {};
+    resetReqForm(); editId = id; setReqRole(r.role || '農家');
+    const set = (k,v)=>{ $(k).value = v==null ? '' : v; };
+    set('reqItem', r.item); set('reqQty', r.qty); set('reqPickupWard', r.pickupWard); set('reqPickup', pv.pickup);
+    set('reqDropWard', r.dropWard); set('reqDrop', pv.drop); set('reqWhen', r.when); set('reqFee', r.fee); set('reqContact', pv.contact); set('reqNote', r.note);
+    $('reqDeadline').value = toLocalInput(r.deadline || Date.now() + 864e5);
+    reqUrls = cloudUrls(r.images).slice(); renderReqPreview();
+    $('reqModalTitle').textContent = '依頼を編集する'; $('postReqBtn').textContent = '変更を保存する';
+    $('reqModalBg').classList.add('active');
+  }
+  $('reqImageInput').addEventListener('change', async e=>{
+    const files = Array.from(e.target.files||[]); e.target.value = '';
+    const room = MAX_IMAGES - reqUrls.length - reqImages.length;
+    if(!files.length) return;
+    if(room<=0) return alert('写真は最大'+MAX_IMAGES+'枚までです。');
+    if(files.length>room) alert('残り'+room+'枚まで追加できます。最初の'+room+'枚を追加します。');
+    for(const f of files.slice(0, room)){
+      if(!f.type.startsWith('image/')) continue;
+      try{ reqImages.push(await compressImage(f, 900, 0.6)); }catch(err){ console.warn(err); }
+    }
+    renderReqPreview();
+  });
+  const cloudOk = () => { const c = window.SAKAI_CLOUDINARY_CONFIG; return !!(c && c.cloudName && c.cloudName!=='YOUR_CLOUD_NAME' && c.uploadPreset && c.uploadPreset!=='YOUR_UNSIGNED_UPLOAD_PRESET'); };
+  async function uploadImages(blobs){
+    const urls = [], c = window.SAKAI_CLOUDINARY_CONFIG;
+    for(const b of blobs){
+      try{
+        const f = new FormData(); f.append('file', b); f.append('upload_preset', c.uploadPreset);
+        const res = await fetch(`https://api.cloudinary.com/v1_1/${c.cloudName}/image/upload`, {method:'POST', body:f});
+        const d = await res.json();
+        if(res.ok && d.secure_url) urls.push(d.secure_url); else console.warn('アップロードに失敗しました', d);
+      }catch(e){ console.warn('アップロードに失敗しました', e); }
+    }
+    return urls;
+  }
+
+  $('postReqBtn').onclick = async ()=>{
+    const v = id => $(id).value.trim();
+    const fee = Math.floor(Number($('reqFee').value));
+    const deadline = new Date($('reqDeadline').value).getTime();
+    if(!v('reqItem') || !v('reqQty') || !v('reqPickup') || !v('reqDrop') || !v('reqContact')) return alert('野菜・数量・集荷先・お届け先・連絡先は必ず入力してください。');
+    if(!(fee > 0)) return alert('配送の報酬は1円以上の金額で入力してください。');
+    if(!(deadline > Date.now())) return alert('受付期限は、いまより後の日時を入力してください。');
+    if(reqImages.length && !cloudOk() && !confirm('写真の保存先（Cloudinary）がまだ設定されていません。新しく選んだ写真なしで進めますか？')) return;
+    const btn = $('postReqBtn'), label = editId ? '変更を保存する' : 'この内容で依頼を出す';
+    btn.disabled = true; btn.textContent = '送信中…';
+    let images = reqUrls.slice();
+    if(reqImages.length && cloudOk()){
+      const up = await uploadImages(reqImages);
+      if(up.length < reqImages.length && !confirm('写真のアップロードに失敗したものがあります（'+up.length+'/'+reqImages.length+'枚）。この枚数で進めますか？')){
+        btn.disabled = false; btn.textContent = label; return;
+      }
+      images = images.concat(up);
+    }
+    const f = { images:images.slice(0, MAX_IMAGES), role, requester:me, item:v('reqItem'), qty:v('reqQty'), pickupWard:$('reqPickupWard').value, dropWard:$('reqDropWard').value,
+      when:v('reqWhen'), fee, note:v('reqNote'), deadline };
+    const priv = { pickup:v('reqPickup'), drop:v('reqDrop'), contact:v('reqContact') };
+    let ok;
+    if(editId){ const old = reqs.find(x=>x.id===editId); ok = old ? await updateReq(editId, {...old, ...f}, priv) : false; }
+    else ok = await insertReq({ id:uid(), courier:null, created:Date.now(), status:'open', ...f }, priv);
+    btn.disabled = false; btn.textContent = label;
+    if(!ok) return alert(editId ? '変更を保存できませんでした。すでに請け負われた可能性があります。' : '保存に失敗しました。もう一度お試しください。');
+    $('reqModalBg').classList.remove('active');
+    resetReqForm();
+    await reload(); render();
+  };
+
+  // ---------- 操作 ----------
+  const setPriv = (id, c) => sb ? sb.from('request_private').update({courier_contact:c}).eq('request_id', id) : null;
+  const act = {
+    accept: async id=>{
+      if(!requireLogin('配送を請け負うには、ログイン（会員登録）が必要です。')) return;
+      const contact = (prompt('依頼者に伝える連絡先（電話番号など）を入力してください')||'').trim();
+      if(!contact) return;
+      transition(id, 'open', n=>{
+        if(n.requesterId===myId()) return 'ご自身の依頼は請け負えません。';
+        if(n.deadline && n.deadline < Date.now()) return 'この依頼は、受付期限が切れています。';
+        Object.assign(n, {status:'accepted', courier:me, courierId:myId(), priv:{...(n.priv||{}), courierContact:contact}});
+      }, ()=> setPriv(id, contact));
+    },
+    cancel: id=> confirm('この依頼を取り消しますか？') && transition(id, 'open', n=>{ n.status='cancelled'; }),
+    drop: async id=>{
+      if(!confirm('この配送を辞退しますか？依頼は募集中に戻ります。')) return;
+      await setPriv(id, null);
+      transition(id, 'accepted', n=>{ Object.assign(n, {status:'open', courier:null, courierId:null}); if(n.priv) n.priv.courierContact = null; });
+    },
+    pick: id=> transition(id, 'accepted', n=>{ n.status='picked'; n.pickedAt=Date.now(); }),
+    done: id=> confirm('お届け先に野菜を渡しましたか？') && transition(id, 'picked', n=>{ n.status='delivered'; n.deliveredAt=Date.now(); }),
+    pay: id=> confirm('配送者に報酬を支払いましたか？「支払い済み」にすると完了になります。') && transition(id, 'delivered', n=>{ n.status='paid'; n.paidAt=Date.now(); }),
+    dm: id=> openDm(id),
+    edit: id=> openEdit(id),
+    del: async id=>{
+      const r = reqs.find(x=>x.id===id); if(!r || r.requesterId!==myId()) return;
+      const msg = (r.courierId && ['accepted','picked','delivered'].includes(r.status))
+        ? `配送者の${r.courier}さんが関わっている依頼です。削除すると、配送者の画面からも消え、メッセージも読めなくなります。先に連絡しましたか？それでも削除しますか？`
+        : r.status==='paid' ? 'この依頼の記録を削除します。配送者の実績（件数・報酬）からも消えます。削除しますか？'
+        : 'この依頼を削除しますか？元に戻せません。';
+      if(!confirm(msg)) return;
+      if(!(await removeReq(id))) alert('削除に失敗しました。');
+      await reload(); render();
+    },
+    adel: async id=>{
+      if(!isAdmin() || !confirm('この依頼を削除しますか？（管理者）')) return;
+      if(!(await removeReq(id))) alert('削除に失敗しました。');
+      await reload(); render();
+    }
+  };
+  document.addEventListener('click', e=>{
+    const b = e.target.closest('[data-act]'); if(!b) return;
+    act[b.dataset.act](b.dataset.id);
+  });
+  const btn = (a, id, label, cls) => `<button class="btn small ${cls||''}" data-act="${a}" data-id="${id}">${label}</button>`;
+
+  // ---------- 表示 ----------
+  const cloudUrls = a => (a||[]).filter(x=>typeof x==='string' && x.startsWith('https://res.cloudinary.com/'));
+  const bioHtml = (id, label) => {
+    const p = profMap[id]; if(!p) return '';
+    const u = cloudUrls(p.photos);
+    return (p.bio ? `<div class="meta">${label}自己紹介：${esc(p.bio)}</div>` : '')
+      + (u.length ? `<div class="req-photos mini">${u.map(x=>`<a href="${esc(x)}" target="_blank" rel="noopener"><img src="${esc(x)}" loading="lazy" alt="農場・お店の写真"></a>`).join('')}</div>` : '');
+  };
+  const photosHtml = r => {
+    const u = (r.images||[]).filter(x=>typeof x==='string' && x.startsWith('https://res.cloudinary.com/'));
+    return u.length ? '<div class="req-photos">'+u.map(x=>`<a href="${esc(x)}" target="_blank" rel="noopener"><img src="${esc(x)}" loading="lazy" alt="野菜の写真"></a>`).join('')+'</div>' : '';
+  };
+  function card(r, mode){
+    const [label, cls] = STATUS[r.status];
+    const isReq = r.requesterId===myId(), isCourier = !!r.courierId && r.courierId===myId(), pv = r.priv || {};
+    let detail = '', actions = '';
+    if(mode==='mine' && (isReq||isCourier) && r.status!=='cancelled'){
+      detail = `<div class="detail">集荷先：${esc(r.pickupWard)} ${esc(pv.pickup)}<br>お届け先：${esc(r.dropWard)} ${esc(pv.drop)}<br>` +
+        (isCourier ? `依頼者の連絡先：${esc(pv.contact)}` : (r.courier ? `配送者：${esc(r.courier)}さん（${esc(pv.courierContact)}）` : '配送者を待っています')) + (!isCourier && r.courierId ? bioHtml(r.courierId, '配送者の') : '') + '</div>';
+    }
+    if(mode==='board'){
+      actions = isReq ? btn('edit', r.id, '編集する', 'outline') + btn('del', r.id, '削除する', 'danger') : btn('accept', r.id, 'この依頼を請け負う', 'sun');
+    } else if(mode==='mine' && isReq){
+      if(r.status==='open') actions = btn('edit', r.id, '編集する', 'outline');
+      if(r.status==='delivered') actions = btn('pay', r.id, `${yen(r.fee)}を支払った（完了にする）`, 'sun');
+      actions += btn('del', r.id, '削除する', 'danger');
+    } else if(mode==='mine' && isCourier){
+      if(r.status==='accepted') actions = btn('pick', r.id, '集荷した', 'sun') + btn('drop', r.id, '辞退する', 'danger');
+      if(r.status==='picked') actions = btn('done', r.id, '配達完了にする', 'sun');
+      if(r.status==='delivered') actions = '<span class="hint">依頼者の支払いを待っています</span>';
+    }
+    if(mode==='mine' && r.courier && (isReq||isCourier) && r.status!=='cancelled') actions = btn('dm', r.id, 'メッセージ'+(unread(r)?'（新着）':''), 'outline') + actions;
+    if(isAdmin() && (mode==='board'||mode==='admin')) actions += btn('adel', r.id, '削除（管理者）', 'danger');
+    return `<div class="card">
+      <span class="pill ${cls}">${label}</span><span class="pill">${esc(r.role)}</span>
+      <h3 class="post-title" style="margin-top:6px;">${esc(r.item)}　<small style="font-weight:normal;font-size:15px;">${esc(r.qty)}</small></h3>
+      <div class="route">${esc(r.pickupWard)} → ${esc(r.dropWard)}</div>
+      <div class="fee">${yen(r.fee)}</div>
+      ${r.status==='open' && r.deadline ? `<div class="meta">受付期限：${fmt(r.deadline)}（過ぎると自動で消えます）</div>` : ''}
+      ${photosHtml(r)}
+      ${r.when ? `<div class="meta">希望日時：${esc(r.when)}</div>` : ''}
+      ${r.note ? `<div class="meta">備考：${esc(r.note)}</div>` : ''}
+      <div class="meta">依頼者：${esc(r.requester)}さん／${fmt(r.created)}</div>${bioHtml(r.requesterId, '依頼者の')}
+      ${detail}${actions ? `<div class="row">${actions}</div>` : ''}
+    </div>`;
+  }
+
+  function renderBoard(){
+    const w = $('filterWard').value;
+    const list = reqs.filter(r=>r.status==='open' && !isExpired(r) && (w==='all' || r.dropWard===w)).sort((a,b)=>b.created-a.created);
+    $('boardList').innerHTML = list.length ? list.map(r=>card(r,'board')).join('')
+      : '<div class="empty-state">いま募集中の依頼はありません。<br>右下の「＋」から、配送を依頼できます。</div>';
+  }
+  function renderMine(){
+    const guest = isGuest();
+    $('mineLogin').style.display = guest ? '' : 'none';
+    $('mineBody').style.display = guest ? 'none' : '';
+    if(guest) return;
+    const jobs = reqs.filter(r=>r.courierId===myId()).sort((a,b)=>b.created-a.created);
+    const mine = reqs.filter(r=>r.requesterId===myId()).sort((a,b)=>b.created-a.created);
+    $('jobList').innerHTML = jobs.length ? jobs.map(r=>card(r,'mine')).join('') : '<div class="empty-state">請け負った配送はまだありません。<br>「依頼一覧」から探してみましょう。</div>';
+    $('myReqList').innerHTML = mine.length ? mine.map(r=>card(r,'mine')).join('') : '<div class="empty-state">出した依頼はまだありません。</div>';
+  }
+  function renderMyPage(){
+    const guest = isGuest();
+    $('mypageLogin').style.display = guest ? '' : 'none';
+    $('mypageBody').style.display = guest ? 'none' : '';
+    if(guest) return;
+    $('mypageName').textContent = me;
+    $('mypageNameInput').value = me;
+    $('logoutBtn').style.display = (sb && authUser) ? '' : 'none';
+    const done = reqs.filter(r=>r.courierId===myId() && r.status==='paid');
+    const earned = done.reduce((s,r)=>s+r.fee, 0);
+    const paidOut = reqs.filter(r=>r.requesterId===myId() && r.status==='paid').reduce((s,r)=>s+r.fee, 0);
+    const asked = reqs.filter(r=>r.requesterId===myId() && r.status!=='cancelled').length;
+    $('statsBox').innerHTML =
+      `<div class="stat">配送した件数<b>${done.length}件</b></div><div class="stat">受け取った報酬<b>${yen(earned)}</b></div>` +
+      `<div class="stat">依頼した件数<b>${asked}件</b></div><div class="stat">支払った報酬<b>${yen(paidOut)}</b></div>`;
+  }
+  // ---------- メッセージ（各自のブラウザ内の鍵で暗号化。依頼者と配送者だけが読めます） ----------
+  const CRYPTO_OK = !!(window.crypto && crypto.subtle);
+  const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+  const unb64 = s => Uint8Array.from(atob(s), c=>c.charCodeAt(0));
+  const RSA = {name:'RSA-OAEP', hash:'SHA-256'};
+  let myKeys = null, msgMeta = {}, dmCache = {}, dmId = null;
+
+  async function ensureKeys(){
+    myKeys = null;
+    if(!sb || !authUser || !CRYPTO_OK) return;
+    try{
+      const st = await sGet('dm_keys');
+      if(st && st.priv && st.pub){
+        myKeys = { priv: await crypto.subtle.importKey('jwk', st.priv, RSA, true, ['decrypt']), pub: st.pub };
+      } else {
+        const kp = await crypto.subtle.generateKey({...RSA, modulusLength:2048, publicExponent:new Uint8Array([1,0,1])}, true, ['encrypt','decrypt']);
+        const pub = await crypto.subtle.exportKey('jwk', kp.publicKey), priv = await crypto.subtle.exportKey('jwk', kp.privateKey);
+        await sSet('dm_keys', {pub, priv});
+        myKeys = { priv: kp.privateKey, pub };
+      }
+      const {error} = await sb.from('pubkeys').upsert({user_id:authUser.id, jwk:myKeys.pub});
+      if(error) console.warn(error);
+    }catch(e){ console.warn('鍵の準備に失敗しました', e); myKeys = null; }
+  }
+  // 本文はAES-GCMで暗号化し、その鍵を「相手」と「自分」の公開鍵で包んで保存する
+  async function encryptFor(text, otherId){
+    const {data} = await sb.from('pubkeys').select('jwk').eq('user_id', otherId).maybeSingle();
+    if(!data) return null;
+    const aes = await crypto.subtle.generateKey({name:'AES-GCM', length:256}, true, ['encrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, aes, new TextEncoder().encode(text));
+    const raw = await crypto.subtle.exportKey('raw', aes);
+    const wrap = async jwk => b64(await crypto.subtle.encrypt({name:'RSA-OAEP'}, await crypto.subtle.importKey('jwk', jwk, RSA, false, ['encrypt']), raw));
+    return { iv:b64(iv), ct:b64(ct), k:{ [otherId]: await wrap(data.jwk), [authUser.id]: await wrap(myKeys.pub) } };
+  }
+  async function decryptMsg(p){
+    try{
+      const w = p.k && p.k[authUser.id]; if(!w || !myKeys) return null;
+      const raw = await crypto.subtle.decrypt({name:'RSA-OAEP'}, myKeys.priv, unb64(w));
+      const aes = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
+      return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM', iv:unb64(p.iv)}, aes, unb64(p.ct)));
+    }catch(e){ return null; }
+  }
+  async function loadMsgMeta(){
+    msgMeta = {};
+    if(!sb || !authUser) return;
+    const {data} = await sb.from('messages').select('request_id,sender_id,created_at').order('created_at');
+    (data||[]).forEach(m=>{ msgMeta[m.request_id] = {from:m.sender_id, t:Date.parse(m.created_at)}; });
+  }
+
+  const rk = id => 'sakai_dm_read_' + myId() + '_' + id;
+  const lastRead = id => { try{ return Number(localStorage.getItem(rk(id))||0); }catch(e){ return 0; } };
+  const markRead = id => { try{ localStorage.setItem(rk(id), String(Date.now())); }catch(e){} };
+  const unread = r => { const m = msgMeta[r.id]; return !!m && m.from!==myId() && m.t>lastRead(r.id); };
+  const threads = () => reqs.filter(r=>r.courierId && (r.requesterId===myId()||r.courierId===myId()) && r.status!=='cancelled');
+
+  function renderMessages(){
+    const guest = isGuest();
+    $('msgLogin').style.display = guest ? '' : 'none';
+    $('msgBody').style.display = guest ? 'none' : '';
+    const tm = r => (msgMeta[r.id]||{t:r.created}).t;
+    const list = guest ? [] : threads().sort((a,b)=>tm(b)-tm(a));
+    $('msgDot').style.display = list.some(unread) ? '' : 'none';
+    if(guest) return;
+    $('inboxList').innerHTML = list.length ? list.map(r=>{
+      const other = r.requesterId===myId() ? r.courier : r.requester;
+      return `<div class="detail convo" data-act="dm" data-id="${r.id}"><div style="flex:1;min-width:0;">
+        <b>${esc(other)}さん</b>　<span class="hint">${esc(r.item)}</span>
+        <div class="meta" style="margin:0;">${msgMeta[r.id] ? fmt(tm(r))+' に更新' : 'まだメッセージはありません'}</div></div>
+        ${unread(r) ? '<span class="nav-dot"></span>' : ''}</div>`;
+    }).join('') : '<div class="empty-state">配送者が決まった依頼があると、ここに会話が表示されます。</div>';
+  }
+  async function drawDm(){
+    const id = dmId, r = reqs.find(x=>x.id===id);
+    if(!r || (r.requesterId!==myId() && r.courierId!==myId())){ $('dmModalBg').classList.remove('active'); dmId=null; return; }
+    const other = r.requesterId===myId() ? r.courier : r.requester;
+    $('dmTitle').textContent = other + 'さんとの会話';
+    $('dmSub').textContent = `${r.item}（${r.pickupWard} → ${r.dropWard}）`;
+    const {data,error} = await sb.from('messages').select('*').eq('request_id', id).order('created_at');
+    if(error || dmId!==id) return;
+    const rows = await Promise.all((data||[]).map(async m=>{
+      if(!(m.id in dmCache)) dmCache[m.id] = await decryptMsg(m.payload);
+      return {m, text:dmCache[m.id]};
+    }));
+    const box = $('dmThread'), atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    box.innerHTML = rows.map(({m,text})=>{ const mine = m.sender_id===myId();
+      return `<div><div class="dm-row ${mine?'me':''}"><div class="dm-bubble">${text==null ? '（この端末では読めません）' : esc(text)}</div></div><div class="dm-time" style="${mine?'text-align:right':''}">${fmt(Date.parse(m.created_at))}</div></div>`;
+    }).join('') || '<div class="empty-state">最初のメッセージを送ってみましょう。</div>';
+    if(atEnd) box.scrollTop = box.scrollHeight;
+    markRead(id);
+  }
+  function openDm(id){
+    if(!requireLogin('メッセージには、ログイン（会員登録）が必要です。')) return;
+    if(!sb) return alert('メッセージは、共有データベース（Supabase）につないだときに使えます。');
+    if(!myKeys) return alert('暗号化の準備ができていません。ページを再読み込みしてから、もう一度お試しください。');
+    dmId = id; $('dmModalBg').classList.add('active');
+    drawDm().then(()=>{ $('dmThread').scrollTop = $('dmThread').scrollHeight; });
+  }
+  $('closeDm').onclick = ()=>{ $('dmModalBg').classList.remove('active'); dmId=null; render(); };
+  $('dmSend').onclick = async ()=>{
+    const text = $('dmInput').value.trim(), r = reqs.find(x=>x.id===dmId);
+    if(!text || !r) return;
+    const other = r.requesterId===myId() ? r.courierId : r.requesterId;
+    $('dmSend').disabled = true;
+    try{
+      const p = await encryptFor(text, other);
+      if(!p) alert('相手の暗号化の準備がまだできていません。相手がもう一度ログインすると送れるようになります。');
+      else{
+        const {error} = await sb.from('messages').insert({request_id:r.id, sender_id:authUser.id, payload:p});
+        if(error) throw error;
+        $('dmInput').value = '';
+      }
+    }catch(e){ console.warn(e); alert('送信に失敗しました。もう一度お試しください。'); }
+    $('dmSend').disabled = false;
+    await drawDm(); $('dmThread').scrollTop = $('dmThread').scrollHeight;
+  };
+
+  function renderAdmin(){
+    $('adminCard').style.display = isAdmin() ? '' : 'none';
+    if(isAdmin()) $('adminList').innerHTML = reqs.slice().sort((a,b)=>b.created-a.created).map(r=>card(r,'admin')).join('') || '<div class="empty-state">依頼はありません。</div>';
+  }
+  function render(){ renderBoard(); renderMine(); renderMessages(); renderMyPage(); renderAdmin(); if(dmId) drawDm(); }
+
+  // ---------- 起動 ----------
+  async function init(){
+    $('storageModeBanner').innerHTML = sb ? '' :
+      '<div class="notice-limit" style="border-radius:0; margin-bottom:0;">現在、この画面は共有データベースにつながっていません（この端末だけの保存になります）。管理者の方は、ページ上部のSupabase設定を入力してください。</div>';
+    if(sb && authUser){ try{ const {data}=await sb.auth.getUser(); if(data&&data.user) authUser=data.user; }catch(e){} }
+    const saved = await sGet('profile', false) || {};
+    const acct = authUser && authUser.user_metadata && authUser.user_metadata.display_name;
+    me = acct || saved.username || ('ゲスト' + Math.floor(Math.random()*900+100));
+    if(!acct && !saved.username) await sSet('profile', {username:me}, false);
+    await loadProfile(); await ensureKeys(); await reload();
+    renderUser(); render(); renderProfile();
+  }
+  async function boot(){
+    if(!initBackend()){ showApp(); await init(); return; }
+    try{ const {data}=await sb.auth.getSession(); if(data&&data.session&&data.session.user) authUser=data.session.user; }catch(e){ console.warn(e); }
+    showApp(); await init();
+    sb.auth.onAuthStateChange(async (ev, s)=>{
+      if(ev==='SIGNED_IN' && s && s.user){ if(authUser) return; authUser=s.user; showApp(); await init(); }
+      else if(ev==='SIGNED_OUT') location.reload();
+    });
+  }
+  // 他の人の操作・新着メッセージを反映するため、15秒ごとに最新の状態を読み込む
+  setInterval(async ()=>{
+    if(document.hidden || $('appRoot').style.display==='none') return;
+    await reload(); render();
+  }, 15000);
+  boot();
+})();
+</script>
+</body>
+</html>
