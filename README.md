@@ -1,1 +1,1 @@
-# midorisenryaku-02
+alter table requests add column if not exists deadline timestamptz;
